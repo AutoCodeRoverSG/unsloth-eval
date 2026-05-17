@@ -215,7 +215,7 @@ def target_environment(notebook_name: str) -> str:
         return "kaggle"
     if base.startswith("AMD-") or "_AMD_" in base:
         return "amd"
-    if base.startswith("HuggingFace Course-") or base.startswith("HuggingFace_Course-"):
+    if base.startswith(("HuggingFace Course-", "HuggingFace_Course-")):
         return "colab"  # HF Course notebooks still run on Colab.
     if "DGX_Spark" in base:
         return "dgx_spark"
