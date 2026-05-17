@@ -296,7 +296,7 @@ def cmd_train(args) -> int:
             args = config,
         )
 
-        def _on_step(step, total, loss, lr, tok_s, peak_gb, elapsed, num_tokens):
+        def _on_step(step, total, loss, lr, tok_s, peak_gb, elapsed, num_tokens, *args):
             losses_per_step.append(round(float(loss), 4))
             print(
                 f"  step {step}/{total}  loss={loss:.4f}  lr={lr:.2e}  "
