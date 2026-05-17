@@ -515,7 +515,7 @@ _SCRIPT_TOKENIZE = re.compile(r"\s*(?:&&|\|\||;|\|(?!\|))\s*")
 # here -- they reference script names, not bin names, so the real bin
 # is in the *target* script's chunk which we already tokenize.
 _SCRIPT_WRAPPERS = {"cross-env", "dotenv", "dotenvx", "env-cmd"}
-_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_]\w*=")
 
 
 def _next_real_bin(words: list[str], idx: int) -> str | None:
