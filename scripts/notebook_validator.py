@@ -616,21 +616,20 @@ def rule_inst_003_peft_torchao(
     torchao_explicit = _install_cell_lower_bound(install_cell, "torchao")
     torchao_resolved = torchao_explicit or res.get("torchao")
     for floor in PEFT_TORCHAO_FLOOR:
-        if cmp_versions(peft_v, floor["trigger_peft"]) >= 0:
-            if (
-                torchao_resolved is None
-                or cmp_versions(torchao_resolved, floor["torchao_floor"]) < 0
-            ):
-                findings.append(
-                    Finding(
-                        rule = "R-INST-003",
-                        file = file,
-                        cell = cell_idx,
-                        severity = "error",
-                        message = f"resolved peft=={peft_v} requires torchao>={floor['torchao_floor']}; install cell asserts torchao={torchao_resolved or '(none)'}",
-                        hint = f'add `!pip install --no-deps --upgrade "torchao>={floor["torchao_floor"]}"` to the install cell',
-                    )
+        if cmp_versions(peft_v, floor["trigger_peft"]) >= 0 and (
+            torchao_resolved is None
+            or cmp_versions(torchao_resolved, floor["torchao_floor"]) < 0
+        ):
+            findings.append(
+                Finding(
+                    rule = "R-INST-003",
+                    file = file,
+                    cell = cell_idx,
+                    severity = "error",
+                    message = f"resolved peft=={peft_v} requires torchao>={floor['torchao_floor']}; install cell asserts torchao={torchao_resolved or '(none)'}",
+                    hint = f'add `!pip install --no-deps --upgrade "torchao>={floor["torchao_floor"]}"` to the install cell',
                 )
+            )
     return findings
 
 
