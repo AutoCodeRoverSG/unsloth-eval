@@ -45,7 +45,7 @@ DEP_FIELDS = (
 
 # Sources where seeing a package name does NOT count as usage.
 EXPECTED_NOISE_FILES = {
-    "studio/frontend/package.json",
+    FRONTEND_PKG,
     "studio/frontend/package-lock.json",
     "studio/backend/core/data_recipe/oxc-validator/package.json",
     "studio/backend/core/data_recipe/oxc-validator/package-lock.json",
@@ -1142,9 +1142,9 @@ def main() -> int:
         # runtime import elsewhere in the repo.
         hits.extend(find_types_runtime_usage(name, tsc_types))
         for cite in script_refs.get(name, []):
-            hits.append(Hit("studio/frontend/package.json", 0, "script_bin", cite))
+            hits.append(Hit(FRONTEND_PKG, 0, "script_bin", cite))
         for cite in package_json_extra_refs(head_pkg, name):
-            hits.append(Hit("studio/frontend/package.json", 0, "pkg_json_field", cite))
+            hits.append(Hit(FRONTEND_PKG, 0, "pkg_json_field", cite))
         top, nested = reachable_install_paths(name)
         importable_top_level = top is not None
         # Source imports of bare specifier `name` resolve ONLY to top-level
