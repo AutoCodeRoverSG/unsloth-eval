@@ -878,11 +878,7 @@ def cmd_drift(args: argparse.Namespace) -> int:
         print(f"FAIL: {update_script} not found", file = sys.stderr)
         return 2
     # Stash any pre-existing dirty state, run the updater, diff, restore.
-    head = (
-        subprocess.check_output(["git", "rev-parse", "HEAD"], cwd = nbdir)
-        .decode()
-        .strip()
-    )
+    subprocess.check_output(["git", "rev-parse", "HEAD"], cwd = nbdir)
     subprocess.run(
         ["git", "-C", str(nbdir), "stash", "--include-untracked"],
         check = False,

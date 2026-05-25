@@ -1871,7 +1871,7 @@ def openenv_vllm_reload_weights():
     try:
         import trl.experimental.openenv.utils as openenv_utils
         import trl.experimental.openenv as openenv
-    except (ImportError, NameError, Exception) as e:
+    except Exception as e:
         logger.info(f"Unsloth: Failed to import trl openenv: {e}")
         logger.info(
             "Unsloth: trl.experimental.openenv not available — skipping RL openenv patches."
@@ -1951,7 +1951,7 @@ def vllm_generation_init_patch():
 
     try:
         import trl.generation.vllm_generation as vllm_generation
-    except (ImportError, NameError, Exception) as e:
+    except Exception as e:
         logger.info(f"Unsloth: Failed to import trl.generation.vllm_generation: {e}")
         return
 
