@@ -1083,11 +1083,6 @@ def cmd_api(args: argparse.Namespace) -> int:
     surface = json.loads(surface_path.read_text())
     converted = pathlib.Path(args.converted_dir).resolve()
     findings: list[Finding] = []
-    fast_models = (
-        set(surface.get("FastVisionModel", []))
-        | set(surface.get("FastLanguageModel", []))
-        | set(surface.get("FastModel", []))
-    )
     for py in sorted(converted.glob("*.py")):
         try:
             tree = ast.parse(py.read_text(encoding = "utf-8"))
@@ -1143,7 +1138,7 @@ def cmd_refresh_colab(args: argparse.Namespace) -> int:
     try:
         with urllib.request.urlopen(COLAB_PIP_FREEZE_URL, timeout = 15) as r:
             data = r.read()
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+    except (urllib.error.URLError, TimeoutError) as e:
         print(f"FAIL: could not fetch {COLAB_PIP_FREEZE_URL}: {e}", file = sys.stderr)
         return 2
     _atomic_write_bytes(out, data)
@@ -1227,7 +1222,7 @@ def cmd_colab_diff(args: argparse.Namespace) -> int:
         try:
             with urllib.request.urlopen(url, timeout = 15) as r:
                 upstream_text = r.read().decode("utf-8", errors = "replace")
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        except (urllib.error.URLError, TimeoutError) as e:
             print(f"::warning::colab-diff: could not fetch {url}: {e}")
             continue
         if not snap_path.exists():

@@ -175,7 +175,7 @@ def _fetch_registry_scripts(name: str, version: str) -> dict[str, str] | None:
     try:
         with urllib.request.urlopen(url, timeout = REGISTRY_TIMEOUT_SECS) as resp:
             body = resp.read()
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+    except (OSError, ValueError):
         return None
     try:
         meta = json.loads(body)
