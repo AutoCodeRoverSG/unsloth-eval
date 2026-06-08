@@ -207,17 +207,16 @@ class GitHubClient:
                     # Surface errors but allow partial data
                     errs = data["errors"]
                     # Retry on RATE_LIMITED
-                    for e in errs:
-                        if e.get("type") == "RATE_LIMITED":
-                            self._sleep_until(
-                                (self.graphql_reset or int(time.time()) + 60)
-                            )
-                            break
-                    else:
-                        # No rate-limit error, log and return partial
-                        log.warning("GraphQL errors: %s", json.dumps(errs)[:400])
-                        return data
-                    continue
+                    is_rate_limited = any(
+                        e.get("type") == "RATE_LIMITED" for e in errs
+                    )
+                    if is_rate_limited:
+                        self._sleep_until(
+                            self.graphql_reset or int(time.time()) + 60
+                        )
+                        continue
+                    # No rate-limit error, log and return partial
+                    log.warning("GraphQL errors: %s", json.dumps(errs)[:400])
                 return data
             except requests.RequestException as e:
                 last_err = e

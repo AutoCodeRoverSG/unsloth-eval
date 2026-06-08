@@ -861,9 +861,7 @@ class TrainingBackend:
         while True:
             try:
                 events.append(q.get_nowait())
-            except queue.Empty:
-                return events
-            except (EOFError, OSError, ValueError):
+            except (queue.Empty, EOFError, OSError, ValueError):
                 return events
 
     # ------------------------------------------------------------------

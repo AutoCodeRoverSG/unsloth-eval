@@ -32,7 +32,7 @@ try:
     codec_model = XCodec2Model.from_pretrained(XCODEC2_MODEL_NAME)
 
 except Exception as e:
-    raise f"ERROR loading XCodec2 model: {e}."
+    raise RuntimeError(f"ERROR loading XCodec2 model: {e}.") from e
 
 codec_model.to("cpu")
 
