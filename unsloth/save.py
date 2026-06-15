@@ -1410,7 +1410,7 @@ def save_to_gguf(
     try:
         quantizer_location, converter_location = check_llama_cpp()
         print("Unsloth: llama.cpp found in the system. Skipping installation.")
-    except:
+    except Exception:
         print("Unsloth: Installing llama.cpp. This might take 3 minutes...")
         if IS_KAGGLE_ENVIRONMENT:
             # Kaggle: no CUDA support due to environment limitations
@@ -1483,10 +1483,7 @@ def save_to_gguf(
     all_saved_locations = initial_files.copy()
 
     # Get CPU count for quantization
-    n_cpus = psutil.cpu_count()
-    if n_cpus is None:
-        n_cpus = 1
-    n_cpus *= 2
+    n_cpus = (psutil.cpu_count() or 1) * 2
 
     if not is_gpt_oss:
         base_gguf = initial_files[0]
@@ -2043,9 +2040,14 @@ def push_to_ollama_hub(username: str, model_name: str, tag: str):
         print("\nMODEL PUBLISHED SUCCESSFULLY")
 
 
-def push_to_ollama(tokenizer, gguf_location, username: str, model_name: str, tag: str):
+def push_to_ollama(
+    tokenizer, gguf_location, username: str, model_name: str, tag: str,
+    base_model_name: str = "",
+):
     model_file = create_ollama_modelfile(
-        tokenizer = tokenizer, gguf_location = gguf_location
+        tokenizer = tokenizer,
+        base_model_name = base_model_name,
+        model_location = gguf_location,
     )
 
     with open(f"Modelfile_{model_name}", "w", encoding = "utf-8") as f:

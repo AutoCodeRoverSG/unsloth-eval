@@ -351,7 +351,7 @@ def MistralForCausalLM_fast_forward(
                 logit_softcapping = logit_softcapping,
             )
             if not return_dict:
-                output = (logits,) + outputs[1:]
+                output = (EMPTY_LOGITS,) + outputs[1:]
                 return (loss,) + output if loss is not None else output
 
             output = CausalLMOutputWithPast(
