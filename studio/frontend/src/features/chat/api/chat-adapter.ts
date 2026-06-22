@@ -253,46 +253,36 @@ function collectTextParts(message: RunMessage): string[] {
   return textParts;
 }
 
+function toImageUrl(src: string): string {
+  return src.startsWith("data:") ? src : `data:image/png;base64,${src}`;
+}
+
+function collectImageUrlParts(
+  content: Array<{ type: string; image?: string }> | undefined,
+): Array<{ type: "image_url"; image_url: { url: string } }> {
+  return (content ?? []).flatMap((part) => {
+    if (part.type !== "image" || !part.image) {
+      return [];
+    }
+
+    return [{
+      type: "image_url",
+      image_url: {
+        url: toImageUrl(part.image),
+      },
+    }];
+  });
+}
+
 function collectImageParts(
   message: RunMessage,
 ): Array<{ type: "image_url"; image_url: { url: string } }> {
-  const parts: Array<{ type: "image_url"; image_url: { url: string } }> = [];
-  
-  for (const part of message.content ?? []) {
-    if (part.type === "image" && "image" in part) {
-      const src = (part as { image: string }).image;
-      if (src) {
-        parts.push({
-          type: "image_url",
-          image_url: {
-            url: src.startsWith("data:") ? src : `data:image/png;base64,${src}`,
-          },
-        });
-      }
-    }
-  }
-  
-  if ("attachments" in message && (message.attachments?.length ?? 0) > 0) {
-    for (const attachment of message.attachments ?? []) {
-      for (const part of attachment.content ?? []) {
-        if (part.type === "image" && "image" in part) {
-          const src = (part as { image: string }).image;
-          if (src) {
-            parts.push({
-              type: "image_url",
-              image_url: {
-                url: src.startsWith("data:")
-                  ? src
-                  : `data:image/png;base64,${src}`,
-              },
-            });
-          }
-        }
-      }
-    }
-  }
-  
-  return parts;
+  return [
+    ...collectImageUrlParts(message.content as Array<{ type: string; image?: string }> | undefined),
+    ...((message.attachments ?? []).flatMap((attachment) =>
+      collectImageUrlParts(attachment.content as Array<{ type: string; image?: string }> | undefined),
+    )),
+  ];
 }
 
 function toOpenAIMessage(message: RunMessage): {
@@ -339,6 +329,23 @@ function extractImageBase64(input: string): string | undefined {
   return input;
 }
 
+function findImageBase64InContent(
+  content: Array<{ type: string; image?: string }> | undefined,
+): string | undefined {
+  for (const part of content ?? []) {
+    if (part.type !== "image" || !part.image) {
+      continue;
+    }
+
+    const encoded = extractImageBase64(part.image);
+    if (encoded) {
+      return encoded;
+    }
+  }
+
+  return undefined;
+}
+
 function findLatestUserImageBase64(messages: RunMessages): string | undefined {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
@@ -347,25 +354,20 @@ function findLatestUserImageBase64(messages: RunMessages): string | undefined {
     }
 
     // Image in message.content (e.g. compare view appends content with image parts)
-    for (const part of message.content ?? []) {
-      if (part.type === "image" && "image" in part) {
-        const encoded = extractImageBase64(part.image);
-        if (encoded) return encoded;
-      }
+    const contentImage = findImageBase64InContent(
+      message.content as Array<{ type: string; image?: string }> | undefined,
+    );
+    if (contentImage) {
+      return contentImage;
     }
 
     // Image in message.attachments (e.g. chat composer)
-    if ("attachments" in message && (message.attachments?.length ?? 0) > 0) {
-      for (const attachment of message.attachments ?? []) {
-        for (const part of attachment.content ?? []) {
-          if (part.type !== "image") {
-            continue;
-          }
-          const encoded = extractImageBase64(part.image);
-          if (encoded) {
-            return encoded;
-          }
-        }
+    for (const attachment of message.attachments ?? []) {
+      const attachmentImage = findImageBase64InContent(
+        attachment.content as Array<{ type: string; image?: string }> | undefined,
+      );
+      if (attachmentImage) {
+        return attachmentImage;
       }
     }
   }
@@ -432,6 +434,27 @@ function waitForModelReady(abortSignal?: AbortSignal): Promise<void> {
  * without selecting one. Prefers GGUF (picks smallest cached variant),
  * falls back to smallest cached safetensors model.
  */
+type AutoLoadPayload = {
+  model_path: string;
+  max_seq_length: number;
+  is_lora: boolean;
+  gguf_variant?: string | null;
+};
+
+function getAutoLoadFailure(
+  blockedByTrustRemoteCode: boolean,
+  hadNonTrustFailure: boolean,
+): {
+  loaded: boolean;
+  blockedByTrustRemoteCode: boolean;
+} {
+  return {
+    loaded: false,
+    blockedByTrustRemoteCode:
+      blockedByTrustRemoteCode && !hadNonTrustFailure,
+  };
+}
+
 async function autoLoadSmallestModel(): Promise<{
   loaded: boolean;
   blockedByTrustRemoteCode: boolean;
@@ -447,12 +470,7 @@ async function autoLoadSmallestModel(): Promise<{
   let blockedByTrustRemoteCode = false;
   let hadNonTrustFailure = false;
 
-  async function canAutoLoad(payload: {
-    model_path: string;
-    max_seq_length: number;
-    is_lora: boolean;
-    gguf_variant?: string | null;
-  }): Promise<boolean> {
+  async function canAutoLoad(payload: AutoLoadPayload): Promise<boolean> {
     const validation = await validateModel({
       ...payload,
       hf_token: hfToken,
@@ -465,6 +483,213 @@ async function autoLoadSmallestModel(): Promise<{
     }
     return true;
   }
+
+  function markNonTrustFailure(): void {
+    hadNonTrustFailure = true;
+  }
+
+  function updateSharedModelState(
+    loadResp: Awaited<ReturnType<typeof loadModel>>,
+  ): void {
+    useChatRuntimeStore.setState({
+      supportsReasoning: loadResp.supports_reasoning ?? false,
+      reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
+      reasoningEnabled: loadResp.supports_reasoning ?? false,
+      reasoningStyle: loadResp.reasoning_style ?? "enable_thinking",
+      supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
+      supportsTools: loadResp.supports_tools ?? false,
+    });
+  }
+
+  function addModelIfMissing(model: ChatModelSummary): void {
+    const runtimeStore = useChatRuntimeStore.getState();
+    if (!runtimeStore.models.some((existingModel) => existingModel.id === model.id)) {
+      runtimeStore.setModels([...runtimeStore.models, model]);
+    }
+  }
+
+  function applyGgufLoadState(
+    modelId: string,
+    variantQuant: string,
+    loadResp: Awaited<ReturnType<typeof loadModel>>,
+  ): void {
+    useChatRuntimeStore.getState().setCheckpoint(modelId, variantQuant);
+    const runtimeStore = useChatRuntimeStore.getState();
+    runtimeStore.setModelRequiresTrustRemoteCode(
+      loadResp.requires_trust_remote_code ?? false,
+    );
+    runtimeStore.setParams({
+      ...runtimeStore.params,
+      maxTokens: loadResp.context_length ?? 131072,
+    });
+    useChatRuntimeStore.setState({
+      ggufContextLength: loadResp.context_length ?? 131072,
+      ggufMaxContextLength:
+        loadResp.max_context_length ?? loadResp.context_length ?? 131072,
+      supportsReasoning: loadResp.supports_reasoning ?? false,
+      reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
+      reasoningEnabled: loadResp.supports_reasoning ?? false,
+      reasoningStyle: loadResp.reasoning_style ?? "enable_thinking",
+      supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
+      supportsTools: loadResp.supports_tools ?? false,
+      toolsEnabled: loadResp.supports_tools ?? false,
+      codeToolsEnabled: loadResp.supports_tools ?? false,
+      kvCacheDtype: loadResp.cache_type_kv ?? null,
+      loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
+      defaultChatTemplate: loadResp.chat_template ?? null,
+      chatTemplateOverride: null,
+      loadedChatTemplateOverride: null,
+      loadedIsMultimodal: isMultimodalResponse(loadResp),
+    });
+  }
+
+  async function tryLoadSmallestGguf(
+    ggufRepos: Awaited<ReturnType<typeof listCachedGguf>>,
+  ): Promise<boolean> {
+    const sortedRepos = [...ggufRepos].sort((a, b) => a.size_bytes - b.size_bytes);
+
+    for (const repo of sortedRepos) {
+      try {
+        const variants = await listGgufVariants(repo.repo_id);
+        const variant = variants.variants
+          .filter((candidate) => candidate.downloaded)
+          .sort((a, b) => a.size_bytes - b.size_bytes)[0];
+        if (!variant) {
+          continue;
+        }
+        if (!(await canAutoLoad({
+          model_path: repo.repo_id,
+          max_seq_length: 0,
+          is_lora: false,
+          gguf_variant: variant.quant,
+        }))) {
+          continue;
+        }
+
+        const loadResp = await loadModel({
+          model_path: repo.repo_id,
+          hf_token: hfToken,
+          max_seq_length: 0,
+          load_in_4bit: true,
+          is_lora: false,
+          gguf_variant: variant.quant,
+          trust_remote_code: trustRemoteCode,
+        });
+        applyGgufLoadState(repo.repo_id, variant.quant, loadResp);
+        // Add model to store so the selector shows the name
+        addModelIfMissing({
+          id: repo.repo_id,
+          name: loadResp.display_name ?? repo.repo_id,
+          isVision: loadResp.is_vision ?? false,
+          isLora: loadResp.is_lora ?? false,
+          isGguf: loadResp.is_gguf ?? false,
+          isAudio: loadResp.is_audio ?? false,
+          audioType: loadResp.audio_type ?? null,
+          hasAudioInput: loadResp.has_audio_input ?? false,
+        });
+        toast.success(`Loaded ${repo.repo_id} (${variant.quant})`, { id: toastId });
+        return true;
+      } catch {
+        markNonTrustFailure();
+      }
+    }
+
+    return false;
+  }
+
+  async function tryLoadSmallestSafetensors(
+    modelRepos: Awaited<ReturnType<typeof listCachedModels>>,
+  ): Promise<boolean> {
+    const sortedRepos = [...modelRepos].sort((a, b) => a.size_bytes - b.size_bytes);
+
+    for (const repo of sortedRepos) {
+      try {
+        if (!(await canAutoLoad({
+          model_path: repo.repo_id,
+          max_seq_length: 4096,
+          is_lora: false,
+          gguf_variant: null,
+        }))) {
+          continue;
+        }
+
+        const loadResp = await loadModel({
+          model_path: repo.repo_id,
+          hf_token: hfToken,
+          max_seq_length: 4096,
+          load_in_4bit: true,
+          is_lora: false,
+          gguf_variant: null,
+          trust_remote_code: trustRemoteCode,
+        });
+        useChatRuntimeStore.getState().setCheckpoint(repo.repo_id);
+        const runtimeStore = useChatRuntimeStore.getState();
+        runtimeStore.setModelRequiresTrustRemoteCode(
+          loadResp.requires_trust_remote_code ?? false,
+        );
+        runtimeStore.setParams({ ...runtimeStore.params, maxTokens: 4096 });
+        updateSharedModelState(loadResp);
+        addModelIfMissing({
+          id: repo.repo_id,
+          name: loadResp.display_name ?? repo.repo_id,
+          isVision: loadResp.is_vision ?? false,
+          isLora: loadResp.is_lora ?? false,
+          isGguf: loadResp.is_gguf ?? false,
+        });
+        useChatRuntimeStore.setState({
+          loadedIsMultimodal: isMultimodalResponse(loadResp),
+        });
+        toast.success(`Loaded ${repo.repo_id}`, { id: toastId });
+        return true;
+      } catch {
+        markNonTrustFailure();
+      }
+    }
+
+    return false;
+  }
+
+  async function tryLoadDefaultGguf(): Promise<boolean> {
+    const defaultPayload: AutoLoadPayload = {
+      model_path: "unsloth/gemma-4-E2B-it-GGUF",
+      max_seq_length: 0,
+      is_lora: false,
+      gguf_variant: "UD-Q4_K_XL",
+    };
+
+    toast("Downloading a small model…", {
+      id: toastId,
+      description: "No downloaded models found. Fetching Gemma-4-E2B-it (UD-Q4_K_XL).",
+      duration: 30000,
+    });
+
+    if (!(await canAutoLoad(defaultPayload))) {
+      toast.dismiss(toastId);
+      return false;
+    }
+
+    const loadResp = await loadModel({
+      ...defaultPayload,
+      hf_token: hfToken,
+      load_in_4bit: true,
+      trust_remote_code: trustRemoteCode,
+    });
+    applyGgufLoadState(
+      defaultPayload.model_path,
+      defaultPayload.gguf_variant ?? "UD-Q4_K_XL",
+      loadResp,
+    );
+    addModelIfMissing({
+      id: defaultPayload.model_path,
+      name: loadResp.display_name ?? "gemma-4-E2B-it-GGUF",
+      isVision: loadResp.is_vision ?? false,
+      isLora: false,
+      isGguf: true,
+    });
+    toast.success("Loaded Gemma-4-E2B-it (UD-Q4_K_XL)", { id: toastId });
+    return true;
+  }
+
   try {
     const [ggufRepos, modelRepos] = await Promise.all([
       listCachedGguf().catch(() => []),
@@ -473,223 +698,30 @@ async function autoLoadSmallestModel(): Promise<{
 
     // Try GGUF first: pick the repo with the smallest total size,
     // then pick its smallest downloaded variant.
-    if (ggufRepos.length > 0) {
-      const sorted = [...ggufRepos].sort((a, b) => a.size_bytes - b.size_bytes);
-      for (const repo of sorted) {
-        try {
-          const variants = await listGgufVariants(repo.repo_id);
-          const downloaded = variants.variants
-            .filter((v) => v.downloaded)
-            .sort((a, b) => a.size_bytes - b.size_bytes);
-          if (downloaded.length > 0) {
-            const variant = downloaded[0];
-            if (
-              !(await canAutoLoad({
-                model_path: repo.repo_id,
-                max_seq_length: 0,
-                is_lora: false,
-                gguf_variant: variant.quant,
-              }))
-            ) {
-              continue;
-            }
-            const loadResp = await loadModel({
-              model_path: repo.repo_id,
-              hf_token: hfToken,
-              max_seq_length: 0,
-              load_in_4bit: true,
-              is_lora: false,
-              gguf_variant: variant.quant,
-              trust_remote_code: trustRemoteCode,
-            });
-            useChatRuntimeStore.getState().setCheckpoint(repo.repo_id, variant.quant);
-            const store = useChatRuntimeStore.getState();
-            store.setModelRequiresTrustRemoteCode(
-              loadResp.requires_trust_remote_code ?? false,
-            );
-            store.setParams({ ...store.params, maxTokens: loadResp.context_length ?? 131072 });
-            // Add model to store so the selector shows the name
-            const autoModel: ChatModelSummary = {
-              id: repo.repo_id,
-              name: loadResp.display_name ?? repo.repo_id,
-              isVision: loadResp.is_vision ?? false,
-              isLora: loadResp.is_lora ?? false,
-              isGguf: loadResp.is_gguf ?? false,
-              isAudio: loadResp.is_audio ?? false,
-              audioType: loadResp.audio_type ?? null,
-              hasAudioInput: loadResp.has_audio_input ?? false,
-            };
-            const existingModels = store.models;
-            if (!existingModels.some((m) => m.id === repo.repo_id)) {
-              store.setModels([...existingModels, autoModel]);
-            }
-            useChatRuntimeStore.setState({
-              ggufContextLength: loadResp.context_length ?? 131072,
-              ggufMaxContextLength: loadResp.max_context_length ?? loadResp.context_length ?? 131072,
-              supportsReasoning: loadResp.supports_reasoning ?? false,
-              reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
-              reasoningEnabled: loadResp.supports_reasoning ?? false,
-              reasoningStyle: loadResp.reasoning_style ?? "enable_thinking",
-              supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
-              supportsTools: loadResp.supports_tools ?? false,
-              toolsEnabled: loadResp.supports_tools ?? false,
-              codeToolsEnabled: loadResp.supports_tools ?? false,
-              kvCacheDtype: loadResp.cache_type_kv ?? null,
-              loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
-              defaultChatTemplate: loadResp.chat_template ?? null,
-              chatTemplateOverride: null,
-              loadedChatTemplateOverride: null,
-              loadedIsMultimodal: isMultimodalResponse(loadResp),
-            });
-            toast.success(`Loaded ${repo.repo_id} (${variant.quant})`, { id: toastId });
-            return { loaded: true, blockedByTrustRemoteCode: false };
-          }
-        } catch {
-          hadNonTrustFailure = true;
-          continue;
-        }
-      }
+    if (await tryLoadSmallestGguf(ggufRepos)) {
+      return { loaded: true, blockedByTrustRemoteCode: false };
     }
 
     // Fall back to safetensors models
-    if (modelRepos.length > 0) {
-      const sorted = [...modelRepos].sort((a, b) => a.size_bytes - b.size_bytes);
-      for (const repo of sorted) {
-        try {
-          if (
-            !(await canAutoLoad({
-              model_path: repo.repo_id,
-              max_seq_length: 4096,
-              is_lora: false,
-              gguf_variant: null,
-            }))
-          ) {
-            continue;
-          }
-          const sfLoadResp = await loadModel({
-            model_path: repo.repo_id,
-            hf_token: hfToken,
-            max_seq_length: 4096,
-            load_in_4bit: true,
-            is_lora: false,
-            gguf_variant: null,
-            trust_remote_code: trustRemoteCode,
-          });
-          useChatRuntimeStore.getState().setCheckpoint(repo.repo_id);
-          const store = useChatRuntimeStore.getState();
-          store.setModelRequiresTrustRemoteCode(
-            sfLoadResp.requires_trust_remote_code ?? false,
-          );
-          store.setParams({ ...store.params, maxTokens: 4096 });
-          useChatRuntimeStore.setState({
-            supportsReasoning: sfLoadResp.supports_reasoning ?? false,
-            reasoningAlwaysOn: sfLoadResp.reasoning_always_on ?? false,
-            reasoningEnabled: sfLoadResp.supports_reasoning ?? false,
-            reasoningStyle: sfLoadResp.reasoning_style ?? "enable_thinking",
-            supportsPreserveThinking: sfLoadResp.supports_preserve_thinking ?? false,
-            supportsTools: sfLoadResp.supports_tools ?? false,
-          });
-          const sfModel: ChatModelSummary = {
-            id: repo.repo_id,
-            name: sfLoadResp.display_name ?? repo.repo_id,
-            isVision: sfLoadResp.is_vision ?? false,
-            isLora: sfLoadResp.is_lora ?? false,
-            isGguf: sfLoadResp.is_gguf ?? false,
-          };
-          if (!store.models.some((m) => m.id === repo.repo_id)) {
-            store.setModels([...store.models, sfModel]);
-          }
-          useChatRuntimeStore.setState({
-            loadedIsMultimodal: isMultimodalResponse(sfLoadResp),
-          });
-          toast.success(`Loaded ${repo.repo_id}`, { id: toastId });
-          return { loaded: true, blockedByTrustRemoteCode: false };
-        } catch {
-          hadNonTrustFailure = true;
-          continue;
-        }
-      }
+    if (await tryLoadSmallestSafetensors(modelRepos)) {
+      return { loaded: true, blockedByTrustRemoteCode: false };
     }
 
     // No cached models found — try downloading a small default GGUF
-    toast("Downloading a small model…", {
-      id: toastId,
-      description: "No downloaded models found. Fetching Gemma-4-E2B-it (UD-Q4_K_XL).",
-      duration: 30000,
-    });
     try {
-      if (
-        !(await canAutoLoad({
-          model_path: "unsloth/gemma-4-E2B-it-GGUF",
-          max_seq_length: 0,
-          is_lora: false,
-          gguf_variant: "UD-Q4_K_XL",
-        }))
-      ) {
-        toast.dismiss(toastId);
-        return { loaded: false, blockedByTrustRemoteCode };
+      if (await tryLoadDefaultGguf()) {
+        return { loaded: true, blockedByTrustRemoteCode: false };
       }
-      const loadResp = await loadModel({
-        model_path: "unsloth/gemma-4-E2B-it-GGUF",
-        hf_token: hfToken,
-        max_seq_length: 0,
-        load_in_4bit: true,
-        is_lora: false,
-        gguf_variant: "UD-Q4_K_XL",
-        trust_remote_code: trustRemoteCode,
-      });
-      useChatRuntimeStore.getState().setCheckpoint("unsloth/gemma-4-E2B-it-GGUF", "UD-Q4_K_XL");
-      const store = useChatRuntimeStore.getState();
-      store.setModelRequiresTrustRemoteCode(
-        loadResp.requires_trust_remote_code ?? false,
-      );
-      store.setParams({ ...store.params, maxTokens: loadResp.context_length ?? 131072 });
-      const defaultModel: ChatModelSummary = {
-        id: "unsloth/gemma-4-E2B-it-GGUF",
-        name: loadResp.display_name ?? "gemma-4-E2B-it-GGUF",
-        isVision: loadResp.is_vision ?? false,
-        isLora: false,
-        isGguf: true,
-      };
-      if (!store.models.some((m) => m.id === "unsloth/gemma-4-E2B-it-GGUF")) {
-        store.setModels([...store.models, defaultModel]);
-      }
-      useChatRuntimeStore.setState({
-        ggufContextLength: loadResp.context_length ?? 131072,
-        ggufMaxContextLength: loadResp.max_context_length ?? loadResp.context_length ?? 131072,
-        supportsReasoning: loadResp.supports_reasoning ?? false,
-        reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
-        reasoningEnabled: loadResp.supports_reasoning ?? false,
-        reasoningStyle: loadResp.reasoning_style ?? "enable_thinking",
-        supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
-        supportsTools: loadResp.supports_tools ?? false,
-        toolsEnabled: loadResp.supports_tools ?? false,
-        codeToolsEnabled: loadResp.supports_tools ?? false,
-        kvCacheDtype: loadResp.cache_type_kv ?? null,
-        loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
-        defaultChatTemplate: loadResp.chat_template ?? null,
-        chatTemplateOverride: null,
-        loadedIsMultimodal: isMultimodalResponse(loadResp),
-      });
-      toast.success("Loaded Gemma-4-E2B-it (UD-Q4_K_XL)", { id: toastId });
-      return { loaded: true, blockedByTrustRemoteCode: false };
+      return { loaded: false, blockedByTrustRemoteCode };
     } catch {
       toast.dismiss(toastId);
-      hadNonTrustFailure = true;
-      return {
-        loaded: false,
-        blockedByTrustRemoteCode:
-          blockedByTrustRemoteCode && !hadNonTrustFailure,
-      };
+      markNonTrustFailure();
+      return getAutoLoadFailure(blockedByTrustRemoteCode, hadNonTrustFailure);
     }
   } catch {
     toast.dismiss(toastId);
-    hadNonTrustFailure = true;
-    return {
-      loaded: false,
-      blockedByTrustRemoteCode:
-        blockedByTrustRemoteCode && !hadNonTrustFailure,
-    };
+    markNonTrustFailure();
+    return getAutoLoadFailure(blockedByTrustRemoteCode, hadNonTrustFailure);
   }
 }
 
@@ -982,256 +1014,267 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             : "low";
         const externalReasoningEnabled =
           !externalReasoningCaps.supportsReasoningOff ? true : reasoningEnabled;
+        const getToolCallTimeout = () => {
+          const mins = useChatRuntimeStore.getState().toolCallTimeout;
+          return mins >= 9999 ? 9999 : mins * 60;
+        };
+        const getLocalReasoningPayload = () => {
+          if (!supportsReasoning) {
+            return {};
+          }
+          if (reasoningStyle === "reasoning_effort") {
+            return reasoningEnabled
+              ? { reasoning_effort: localReasoningEffort }
+              : {};
+          }
+          return { enable_thinking: reasoningEnabled };
+        };
+        const getExternalReasoningPayload = () => {
+          if (!externalReasoningCaps.supportsReasoning) {
+            return {};
+          }
+          if (externalReasoningCaps.reasoningStyle !== "reasoning_effort") {
+            return { enable_thinking: reasoningEnabled };
+          }
+          if (externalReasoningEnabled) {
+            return { reasoning_effort: selectedExternalEffort };
+          }
+          if (externalReasoningCaps.supportsReasoningOff) {
+            return { reasoning_effort: "none" as const };
+          }
+          return { reasoning_effort: fallbackExternalEffort };
+        };
+        const getLocalToolsPayload = () => {
+          if (!supportsTools || (!toolsEnabled && !codeToolsEnabled)) {
+            return {};
+          }
+          return {
+            enable_tools: true,
+            enabled_tools: [
+              ...(toolsEnabled ? ["web_search"] : []),
+              ...(codeToolsEnabled ? ["python", "terminal"] : []),
+            ],
+            auto_heal_tool_calls: useChatRuntimeStore.getState().autoHealToolCalls,
+            max_tool_calls_per_message: useChatRuntimeStore.getState().maxToolCallsPerMessage,
+            tool_call_timeout: getToolCallTimeout(),
+          };
+        };
+        const getExternalToolsPayload = (
+          selectedExternalProvider: NonNullable<typeof externalProvider>,
+          selectedExternalSelection: NonNullable<typeof externalSelection>,
+        ) => {
+          const webSearchEnabled =
+            toolsEnabled &&
+            providerSupportsBuiltinWebSearch(selectedExternalProvider.providerType);
+          const codeExecutionEnabled =
+            codeToolsEnabled &&
+            providerSupportsBuiltinCodeExecution(
+              selectedExternalProvider.providerType,
+              selectedExternalSelection.modelId,
+              selectedExternalProvider.baseUrl,
+            );
+          if (!webSearchEnabled && !codeExecutionEnabled) {
+            return {};
+          }
+          return {
+            enable_tools: true,
+            enabled_tools: [
+              ...(webSearchEnabled ? ["web_search"] : []),
+              ...(codeExecutionEnabled ? ["code_execution"] : []),
+            ],
+          };
+        };
+        const getOpenAIThreadContainerId = async (
+          providerType: string,
+          modelId: string,
+          baseUrl: string | null | undefined,
+          providerApiKey: string | null,
+        ) => {
+          const codeExecEnabledForThisTurn =
+            codeToolsEnabled &&
+            providerSupportsBuiltinCodeExecution(providerType, modelId, baseUrl);
+          if (!codeExecEnabledForThisTurn || !resolvedThreadId) {
+            return null;
+          }
+
+          let openaiCodeExecContainerId: string | null = null;
+
+          try {
+            const thread = await db.threads.get(resolvedThreadId);
+            openaiCodeExecContainerId = thread?.openaiCodeExecContainerId ?? null;
+          } catch {
+            openaiCodeExecContainerId = null;
+          }
+
+          if (
+            openaiCodeExecContainerId ||
+            providerType !== "openai"
+          ) {
+            return openaiCodeExecContainerId;
+          }
+
+          try {
+            const others = await db.threads
+              .orderBy("createdAt")
+              .reverse()
+              .toArray();
+            const reusableThread = others.find(
+              (thread) =>
+                thread.id !== resolvedThreadId && thread.openaiCodeExecContainerId,
+            );
+            if (reusableThread?.openaiCodeExecContainerId) {
+              openaiCodeExecContainerId = reusableThread.openaiCodeExecContainerId;
+              void db.threads
+                .update(resolvedThreadId, {
+                  openaiCodeExecContainerId,
+                })
+                .catch(() => {});
+              return openaiCodeExecContainerId;
+            }
+          } catch {
+            /* fall through to lazy-create below */
+          }
+
+          const ttl = externalProvider.openaiContainerTtlMinutes;
+          const ttlToUse = typeof ttl === "number" && ttl >= 1 ? ttl : 20;
+          try {
+            const created = await createOpenAIContainer(
+              {
+                apiKey: providerApiKey,
+                baseUrl: baseUrl || null,
+              },
+              {
+                // Friendly English-word name so the container
+                // is human-readable in the picker list (e.g.
+                // "kestrel-3f9c") instead of a thread-id slug
+                // or OpenAI's default blank name.
+                name: pickFriendlyContainerName(),
+                ttlMinutes: ttlToUse,
+              },
+            );
+            openaiCodeExecContainerId = created.id;
+            void db.threads
+              .update(resolvedThreadId, {
+                openaiCodeExecContainerId: created.id,
+              })
+              .catch(() => {});
+          } catch {
+            // Fall back to backend's container_auto path on
+            // failure — keeps the chat moving; the next turn
+            // can retry. The auto-created container will be
+            // unnamed, but the chat doesn't break.
+            openaiCodeExecContainerId = null;
+          }
+
+          return openaiCodeExecContainerId;
+        };
+        const buildExternalRequestPayload = async (
+          selectedExternalProvider: NonNullable<typeof externalProvider>,
+          selectedExternalSelection: NonNullable<typeof externalSelection>,
+          forceRefreshPublicKey = false,
+        ): Promise<OpenAIChatCompletionsRequest> => {
+          const openaiCodeExecContainerId = await getOpenAIThreadContainerId(
+            selectedExternalProvider.providerType,
+            selectedExternalSelection.modelId,
+            selectedExternalProvider.baseUrl,
+            externalApiKey,
+          );
+
+          return {
+            model: selectedExternalSelection.modelId,
+            messages: outboundMessages,
+            stream: true,
+            // Reasoning-class models (OpenAI gpt-5.x / o3) reject temperature
+            // and top_p; only forward when the active provider supports them.
+            ...(externalCapabilities?.temperature !== false
+              ? { temperature: params.temperature }
+              : {}),
+            ...(externalCapabilities?.topP !== false
+              ? { top_p: params.topP }
+              : {}),
+            // Clamp to the cross-provider output cap so a maxTokens value
+            // carried over from a local-model session does not blow past
+            // provider limits (e.g. Claude Opus 400s on >128k). Also
+            // floor to the provider's documented minimum — Kimi's
+            // thinking models need >=16k or the response truncates
+            // before the answer fits alongside reasoning_content.
+            max_tokens: Math.min(
+              Math.max(
+                params.maxTokens,
+                getExternalMinOutputTokens(selectedExternalProvider.providerType),
+              ),
+              EXTERNAL_MAX_OUTPUT_TOKENS,
+            ),
+            // Only forward sampling knobs the provider actually accepts; the
+            // backend's external-provider proxy is param-permissive and would
+            // surface a 400 from providers that reject unknown fields (e.g.
+            // OpenAI rejects top_k, Anthropic/DeepSeek reject presence_penalty).
+            ...(externalCapabilities?.topK ? { top_k: params.topK } : {}),
+            ...(externalCapabilities?.presencePenalty
+              ? { presence_penalty: params.presencePenalty }
+              : {}),
+            ...getExternalToolsPayload(
+              selectedExternalProvider,
+              selectedExternalSelection,
+            ),
+            provider_id: selectedExternalProvider.id,
+            provider_type: externalBackendProviderType,
+            external_model: selectedExternalSelection.modelId,
+            ...(externalApiKey
+              ? {
+                  encrypted_api_key: await encryptProviderApiKey(
+                    externalApiKey,
+                    forceRefreshPublicKey,
+                  ),
+                }
+              : {}),
+            provider_base_url: selectedExternalProvider.baseUrl || null,
+            ...(openaiCodeExecContainerId
+              ? {
+                  openai_code_exec_container_id: openaiCodeExecContainerId,
+                }
+              : {}),
+            ...(supportsProviderPromptCaching(selectedExternalProvider.providerType)
+              ? {
+                  enable_prompt_caching:
+                    selectedExternalProvider.enablePromptCaching ?? true,
+                }
+              : {}),
+            ...getExternalReasoningPayload(),
+          };
+        };
+        const buildLocalRequestPayload = (): OpenAIChatCompletionsRequest => ({
+          model: params.checkpoint,
+          messages: outboundMessages,
+          stream: true,
+          temperature: params.temperature,
+          top_p: params.topP,
+          max_tokens: params.maxTokens,
+          top_k: params.topK,
+          min_p: params.minP,
+          repetition_penalty: params.repetitionPenalty,
+          presence_penalty: params.presencePenalty,
+          image_base64: imageBase64,
+          audio_base64: audioBase64,
+          cancel_id: cancelId,
+          ...(resolvedThreadId ? { session_id: resolvedThreadId } : {}),
+          ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
+          ...getLocalReasoningPayload(),
+          ...(supportsPreserveThinking ? { preserve_thinking: preserveThinking } : {}),
+          ...getLocalToolsPayload(),
+        });
         const buildRequestPayload = async (
           forceRefreshPublicKey = false,
         ): Promise<OpenAIChatCompletionsRequest> => {
           if (externalSelection && externalProvider) {
-            // OpenAI shell-tool container reuse: pull the per-thread
-            // container_id (if any) so subsequent turns in the same
-            // thread reference the existing container instead of
-            // auto-creating a fresh one. Empty string / undefined →
-            // backend falls back to container_auto. Anthropic doesn't
-            // use this (server-side per-turn container).
-            let openaiCodeExecContainerId: string | null = null;
-            const codeExecEnabledForThisTurn =
-              codeToolsEnabled &&
-              providerSupportsBuiltinCodeExecution(
-                externalProvider.providerType,
-                externalSelection.modelId,
-                externalProvider.baseUrl,
-              );
-            if (codeExecEnabledForThisTurn && resolvedThreadId) {
-              try {
-                const thread = await db.threads.get(resolvedThreadId);
-                openaiCodeExecContainerId =
-                  thread?.openaiCodeExecContainerId ?? null;
-              } catch {
-                openaiCodeExecContainerId = null;
-              }
-              // Cross-thread inheritance: when the active thread has
-              // no container yet, default to the one most recently
-              // used on *any* other thread (provider-scoped).
-              // Matches what the Code Execution settings section
-              // shows in the picker, and keeps the user from getting
-              // a fresh container on every new thread. The picker
-              // can still be set to "Auto-create per thread"
-              // explicitly to opt into a fresh container — but
-              // that's done via the dropdown, not silently.
-              if (
-                !openaiCodeExecContainerId &&
-                externalProvider.providerType === "openai"
-              ) {
-                try {
-                  const others = await db.threads
-                    .orderBy("createdAt")
-                    .reverse()
-                    .toArray();
-                  for (const t of others) {
-                    if (t.id === resolvedThreadId) continue;
-                    if (t.openaiCodeExecContainerId) {
-                      openaiCodeExecContainerId = t.openaiCodeExecContainerId;
-                      void db.threads
-                        .update(resolvedThreadId, {
-                          openaiCodeExecContainerId,
-                        })
-                        .catch(() => {});
-                      break;
-                    }
-                  }
-                } catch {
-                  /* fall through to lazy-create below */
-                }
-              }
-              // Lazy pre-create when there's no inherited container.
-              // We always POST /v1/containers ourselves (rather than
-              // letting the backend send container_auto) so every
-              // container shows up in the picker with a friendly
-              // English-word name and the user's configured TTL.
-              // Falls back to container_auto only if the POST fails
-              // — keeps the chat moving in that case.
-              if (
-                !openaiCodeExecContainerId &&
-                externalProvider.providerType === "openai"
-              ) {
-                const ttl = externalProvider.openaiContainerTtlMinutes;
-                const ttlToUse =
-                  typeof ttl === "number" && ttl >= 1 ? ttl : 20;
-                try {
-                  const created = await createOpenAIContainer(
-                    {
-                      apiKey: externalApiKey,
-                      baseUrl: externalProvider.baseUrl || null,
-                    },
-                    {
-                      // Friendly English-word name so the container
-                      // is human-readable in the picker list (e.g.
-                      // "kestrel-3f9c") instead of a thread-id slug
-                      // or OpenAI's default blank name.
-                      name: pickFriendlyContainerName(),
-                      ttlMinutes: ttlToUse,
-                    },
-                  );
-                  openaiCodeExecContainerId = created.id;
-                  void db.threads
-                    .update(resolvedThreadId, {
-                      openaiCodeExecContainerId: created.id,
-                    })
-                    .catch(() => {});
-                } catch {
-                  // Fall back to backend's container_auto path on
-                  // failure — keeps the chat moving; the next turn
-                  // can retry. The auto-created container will be
-                  // unnamed, but the chat doesn't break.
-                  openaiCodeExecContainerId = null;
-                }
-              }
-            }
-            return {
-              model: externalSelection.modelId,
-              messages: outboundMessages,
-              stream: true,
-              // Reasoning-class models (OpenAI gpt-5.x / o3) reject temperature
-              // and top_p; only forward when the active provider supports them.
-              ...(externalCapabilities?.temperature !== false
-                ? { temperature: params.temperature }
-                : {}),
-              ...(externalCapabilities?.topP !== false
-                ? { top_p: params.topP }
-                : {}),
-              // Clamp to the cross-provider output cap so a maxTokens value
-              // carried over from a local-model session does not blow past
-              // provider limits (e.g. Claude Opus 400s on >128k). Also
-              // floor to the provider's documented minimum — Kimi's
-              // thinking models need >=16k or the response truncates
-              // before the answer fits alongside reasoning_content.
-              max_tokens: Math.min(
-                Math.max(
-                  params.maxTokens,
-                  getExternalMinOutputTokens(externalProvider?.providerType),
-                ),
-                EXTERNAL_MAX_OUTPUT_TOKENS,
-              ),
-              // Only forward sampling knobs the provider actually accepts; the
-              // backend's external-provider proxy is param-permissive and would
-              // surface a 400 from providers that reject unknown fields (e.g.
-              // OpenAI rejects top_k, Anthropic/DeepSeek reject presence_penalty).
-              ...(externalCapabilities?.topK ? { top_k: params.topK } : {}),
-              ...(externalCapabilities?.presencePenalty
-                ? { presence_penalty: params.presencePenalty }
-                : {}),
-              // Built-in tools: Search pill maps to provider-side
-              // web_search (currently OpenAI / Anthropic / OpenRouter /
-              // Kimi); Code pill maps to Anthropic's server-side
-              // code_execution_20250825 tool (Anthropic is the only
-              // external provider that ships one today). Backend
-              // translates enabled_tools into each provider's tool
-              // schema — for Anthropic that's the entries appended to
-              // body["tools"] inside _stream_anthropic.
-              ...((toolsEnabled &&
-                providerSupportsBuiltinWebSearch(externalProvider.providerType)) ||
-              (codeToolsEnabled &&
-                providerSupportsBuiltinCodeExecution(
-                  externalProvider.providerType,
-                  externalSelection.modelId,
-                  externalProvider.baseUrl,
-                ))
-                ? {
-                    enable_tools: true,
-                    enabled_tools: [
-                      ...(toolsEnabled &&
-                      providerSupportsBuiltinWebSearch(
-                        externalProvider.providerType,
-                      )
-                        ? ["web_search"]
-                        : []),
-                      ...(codeToolsEnabled &&
-                      providerSupportsBuiltinCodeExecution(
-                        externalProvider.providerType,
-                        externalSelection.modelId,
-                        externalProvider.baseUrl,
-                      )
-                        ? ["code_execution"]
-                        : []),
-                    ],
-                  }
-                : {}),
-              provider_id: externalProvider.id,
-              provider_type: externalBackendProviderType,
-              external_model: externalSelection.modelId,
-              ...(externalApiKey
-                ? {
-                    encrypted_api_key: await encryptProviderApiKey(
-                      externalApiKey,
-                      forceRefreshPublicKey,
-                    ),
-                  }
-                : {}),
-              provider_base_url: externalProvider.baseUrl || null,
-              ...(openaiCodeExecContainerId
-                ? {
-                    openai_code_exec_container_id: openaiCodeExecContainerId,
-                  }
-                : {}),
-              ...(supportsProviderPromptCaching(externalProvider.providerType)
-                ? {
-                    enable_prompt_caching:
-                      externalProvider.enablePromptCaching ?? true,
-                  }
-                : {}),
-              ...(externalReasoningCaps.supportsReasoning
-                ? externalReasoningCaps.reasoningStyle === "reasoning_effort"
-                  ? externalReasoningEnabled
-                    ? { reasoning_effort: selectedExternalEffort }
-                    : externalReasoningCaps.supportsReasoningOff
-                      ? { reasoning_effort: "none" }
-                      : {
-                          reasoning_effort: fallbackExternalEffort,
-                        }
-                  : { enable_thinking: reasoningEnabled }
-                : {}),
-            };
+            return buildExternalRequestPayload(
+              externalProvider,
+              externalSelection,
+              forceRefreshPublicKey,
+            );
           }
 
-          return {
-            model: params.checkpoint,
-            messages: outboundMessages,
-            stream: true,
-            temperature: params.temperature,
-            top_p: params.topP,
-            max_tokens: params.maxTokens,
-            top_k: params.topK,
-            min_p: params.minP,
-            repetition_penalty: params.repetitionPenalty,
-            presence_penalty: params.presencePenalty,
-            image_base64: imageBase64,
-            audio_base64: audioBase64,
-            cancel_id: cancelId,
-            ...(resolvedThreadId ? { session_id: resolvedThreadId } : {}),
-            ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
-            ...(supportsReasoning
-              ? reasoningStyle === "reasoning_effort"
-                ? reasoningEnabled
-                  ? { reasoning_effort: localReasoningEffort }
-                  : {}
-                : { enable_thinking: reasoningEnabled }
-              : {}),
-            ...(supportsPreserveThinking ? { preserve_thinking: preserveThinking } : {}),
-            ...(supportsTools && (toolsEnabled || codeToolsEnabled)
-              ? {
-                  enable_tools: true,
-                  enabled_tools: [
-                    ...(toolsEnabled ? ["web_search"] : []),
-                    ...(codeToolsEnabled ? ["python", "terminal"] : []),
-                  ],
-                  auto_heal_tool_calls: useChatRuntimeStore.getState().autoHealToolCalls,
-                  max_tool_calls_per_message: useChatRuntimeStore.getState().maxToolCallsPerMessage,
-                  tool_call_timeout: (() => {
-                    const mins = useChatRuntimeStore.getState().toolCallTimeout;
-                    return mins >= 9999 ? 9999 : mins * 60;
-                  })(),
-                }
-              : {}),
-          };
+          return buildLocalRequestPayload();
         };
 
         let retriedWithRefreshedKey = false;
