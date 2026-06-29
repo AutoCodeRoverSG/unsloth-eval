@@ -1975,6 +1975,177 @@ def iter_published_release_bundles(
         yield bundle
 
 
+def _join_or_none(items: Iterable[str]) -> str:
+    joined = ",".join(items)
+    return joined if joined else "none"
+
+
+def _build_cuda_selection_log(
+    release: PublishedReleaseBundle,
+    selection_preamble: Iterable[str],
+    host_sms: list[str],
+    detected_runtime_lines: list[str],
+    driver_runtime_lines: list[str],
+    runtime_lines: list[str],
+    runtime_dirs: dict[str, list[str]],
+    published_artifacts: list[PublishedLlamaArtifact],
+) -> list[str]:
+    selection_log = (
+        list(release.selection_log)
+        + list(selection_preamble)
+        + [
+            f"linux_cuda_selection: release={release.release_tag}",
+            f"linux_cuda_selection: detected_sms={','.join(host_sms) if host_sms else 'unknown'}",
+            "linux_cuda_selection: detected_runtime_lines="
+            + _join_or_none(detected_runtime_lines),
+            "linux_cuda_selection: driver_runtime_lines="
+            + _join_or_none(driver_runtime_lines),
+            "linux_cuda_selection: compatible_runtime_lines="
+            + _join_or_none(runtime_lines),
+        ]
+    )
+    for rt_line in ("cuda13", "cuda12"):
+        dirs = runtime_dirs.get(rt_line)
+        selection_log.append(
+            f"linux_cuda_selection: runtime_dirs {rt_line}="
+            + (",".join(dirs) if dirs else "none")
+        )
+    published_asset_names = sorted(
+        artifact.asset_name for artifact in published_artifacts
+    )
+    selection_log.append(
+        "linux_cuda_selection: published_assets="
+        + _join_or_none(published_asset_names)
+    )
+    return selection_log
+
+
+def _apply_preferred_runtime_order(
+    ordered_runtime_lines: list[str],
+    preferred_runtime_line: str | None,
+    selection_log: list[str],
+) -> list[str]:
+    if not preferred_runtime_line:
+        return ordered_runtime_lines
+    if preferred_runtime_line in ordered_runtime_lines:
+        reordered = [preferred_runtime_line] + [
+            rt_line
+            for rt_line in ordered_runtime_lines
+            if rt_line != preferred_runtime_line
+        ]
+        selection_log.append(
+            "linux_cuda_selection: torch_preferred_runtime_line="
+            f"{preferred_runtime_line} reordered_attempts={','.join(reordered)}"
+        )
+        return reordered
+    selection_log.append(
+        "linux_cuda_selection: torch_preferred_runtime_line="
+        f"{preferred_runtime_line} unavailable_on_host"
+    )
+    return ordered_runtime_lines
+
+
+def _evaluate_artifact_for_host(
+    artifact: PublishedLlamaArtifact,
+    host_sms: list[str],
+    runtime_line: str,
+    asset_url: str | None,
+    selection_log: list[str],
+) -> str | None:
+    asset_name = artifact.asset_name
+    if not asset_url:
+        selection_log.append(
+            f"linux_cuda_selection: reject {asset_name} missing asset"
+        )
+        return "skip"
+    if not host_sms and artifact.coverage_class != "portable":
+        selection_log.append(
+            "linux_cuda_selection: reject "
+            f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
+            "reason=unknown_compute_caps_prefer_portable"
+        )
+        return "skip"
+    if not artifact.supported_sms:
+        selection_log.append(
+            "linux_cuda_selection: reject "
+            f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
+            "reason=artifact_missing_supported_sms"
+        )
+        return "skip"
+    if artifact.min_sm is None or artifact.max_sm is None:
+        selection_log.append(
+            "linux_cuda_selection: reject "
+            f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
+            "reason=artifact_missing_sm_bounds"
+        )
+        return "skip"
+    reject_reason = _check_sm_compatibility(
+        artifact, host_sms, runtime_line, selection_log,
+    )
+    if reject_reason:
+        return "skip"
+    selection_log.append(
+        "linux_cuda_selection: accept "
+        f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
+        f"coverage={artifact.min_sm}-{artifact.max_sm} supported={','.join(artifact.supported_sms)}"
+    )
+    return None
+
+
+def _check_sm_compatibility(
+    artifact: PublishedLlamaArtifact,
+    host_sms: list[str],
+    runtime_line: str,
+    selection_log: list[str],
+) -> bool:
+    supported_sms = {str(value) for value in artifact.supported_sms}
+    missing_sms = [sm for sm in host_sms if sm not in supported_sms]
+    out_of_range_sms = [
+        sm
+        for sm in host_sms
+        if not (artifact.min_sm <= int(sm) <= artifact.max_sm)
+    ]
+    reasons: list[str] = []
+    if missing_sms:
+        reasons.append(f"missing_sms={','.join(missing_sms)}")
+    if out_of_range_sms:
+        reasons.append(f"out_of_range_sms={','.join(out_of_range_sms)}")
+    if reasons:
+        selection_log.append(
+            "linux_cuda_selection: reject "
+            f"{artifact.asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
+            f"coverage={artifact.min_sm}-{artifact.max_sm} supported={','.join(artifact.supported_sms)} "
+            f"reasons={' '.join(reasons)}"
+        )
+        return True
+    return False
+
+
+def _collect_candidates_for_runtime_line(
+    runtime_line: str,
+    published_artifacts: list[PublishedLlamaArtifact],
+    release_assets: dict[str, str],
+    host_sms: list[str],
+    selection_log: list[str],
+) -> tuple[list[tuple[PublishedLlamaArtifact, str]], tuple[PublishedLlamaArtifact, str] | None]:
+    coverage_candidates: list[tuple[PublishedLlamaArtifact, str]] = []
+    portable_candidate: tuple[PublishedLlamaArtifact, str] | None = None
+    for artifact in published_artifacts:
+        if artifact.runtime_line != runtime_line:
+            continue
+        asset_url = release_assets.get(artifact.asset_name)
+        result = _evaluate_artifact_for_host(
+            artifact, host_sms, runtime_line, asset_url, selection_log,
+        )
+        if result == "skip":
+            continue
+        if artifact.coverage_class == "portable":
+            portable_candidate = (artifact, asset_url)
+        else:
+            coverage_candidates.append((artifact, asset_url))
+    return coverage_candidates, portable_candidate
+
+
 def linux_cuda_choice_from_release(
     host: HostInfo,
     release: PublishedReleaseBundle,
@@ -1985,46 +2156,19 @@ def linux_cuda_choice_from_release(
     detected_runtime_lines, runtime_dirs = detected_linux_runtime_lines()
     driver_runtime_lines = compatible_linux_runtime_lines(host)
     runtime_lines = [
-        runtime_line
-        for runtime_line in detected_runtime_lines
-        if runtime_line in driver_runtime_lines
+        rt_line
+        for rt_line in detected_runtime_lines
+        if rt_line in driver_runtime_lines
     ]
-    ordered_runtime_lines = list(runtime_lines)
-    selection_log = (
-        list(release.selection_log)
-        + list(selection_preamble)
-        + [
-            f"linux_cuda_selection: release={release.release_tag}",
-            f"linux_cuda_selection: detected_sms={','.join(host_sms) if host_sms else 'unknown'}",
-            "linux_cuda_selection: detected_runtime_lines="
-            + (",".join(detected_runtime_lines) if detected_runtime_lines else "none"),
-            "linux_cuda_selection: driver_runtime_lines="
-            + (",".join(driver_runtime_lines) if driver_runtime_lines else "none"),
-            "linux_cuda_selection: compatible_runtime_lines="
-            + (",".join(runtime_lines) if runtime_lines else "none"),
-        ]
-    )
-    for runtime_line in ("cuda13", "cuda12"):
-        selection_log.append(
-            "linux_cuda_selection: runtime_dirs "
-            f"{runtime_line}="
-            + (
-                ",".join(runtime_dirs.get(runtime_line, []))
-                if runtime_dirs.get(runtime_line)
-                else "none"
-            )
-        )
     published_artifacts = [
         artifact
         for artifact in release.artifacts
         if artifact.install_kind == "linux-cuda"
     ]
-    published_asset_names = sorted(
-        artifact.asset_name for artifact in published_artifacts
-    )
-    selection_log.append(
-        "linux_cuda_selection: published_assets="
-        + (",".join(published_asset_names) if published_asset_names else "none")
+    selection_log = _build_cuda_selection_log(
+        release, selection_preamble, host_sms,
+        detected_runtime_lines, driver_runtime_lines, runtime_lines,
+        runtime_dirs, published_artifacts,
     )
 
     if not host_sms:
@@ -2037,125 +2181,20 @@ def linux_cuda_choice_from_release(
         )
         return None
 
-    if preferred_runtime_line:
-        if preferred_runtime_line in ordered_runtime_lines:
-            ordered_runtime_lines = [preferred_runtime_line] + [
-                runtime_line
-                for runtime_line in ordered_runtime_lines
-                if runtime_line != preferred_runtime_line
-            ]
-            selection_log.append(
-                "linux_cuda_selection: torch_preferred_runtime_line="
-                f"{preferred_runtime_line} reordered_attempts={','.join(ordered_runtime_lines)}"
-            )
-        else:
-            selection_log.append(
-                "linux_cuda_selection: torch_preferred_runtime_line="
-                f"{preferred_runtime_line} unavailable_on_host"
-            )
+    ordered_runtime_lines = _apply_preferred_runtime_order(
+        list(runtime_lines), preferred_runtime_line, selection_log,
+    )
 
     attempts: list[AssetChoice] = []
     seen_attempts: set[str] = set()
 
-    def add_attempt(
-        artifact: PublishedLlamaArtifact, asset_url: str, reason: str
-    ) -> None:
-        asset_name = artifact.asset_name
-        if asset_name in seen_attempts:
-            return
-        seen_attempts.add(asset_name)
-        attempts.append(
-            AssetChoice(
-                repo = release.repo,
-                tag = release.release_tag,
-                name = asset_name,
-                url = asset_url,
-                source_label = "published",
-                is_ready_bundle = True,
-                install_kind = "linux-cuda",
-                bundle_profile = artifact.bundle_profile,
-                runtime_line = artifact.runtime_line,
-                coverage_class = artifact.coverage_class,
-                supported_sms = artifact.supported_sms,
-                min_sm = artifact.min_sm,
-                max_sm = artifact.max_sm,
-                selection_log = list(selection_log)
-                + [
-                    "linux_cuda_selection: selected "
-                    f"{asset_name} runtime_line={artifact.runtime_line} coverage_class={artifact.coverage_class} reason={reason}"
-                ],
-            )
-        )
-
     for runtime_line in ordered_runtime_lines:
-        coverage_candidates: list[tuple[PublishedLlamaArtifact, str]] = []
-        portable_candidate: tuple[PublishedLlamaArtifact, str] | None = None
-        for artifact in published_artifacts:
-            if artifact.runtime_line != runtime_line:
-                continue
-            asset_name = artifact.asset_name
-            asset_url = release.assets.get(asset_name)
-            if not asset_url:
-                selection_log.append(
-                    f"linux_cuda_selection: reject {asset_name} missing asset"
-                )
-                continue
-            if not host_sms and artifact.coverage_class != "portable":
-                selection_log.append(
-                    "linux_cuda_selection: reject "
-                    f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
-                    "reason=unknown_compute_caps_prefer_portable"
-                )
-                continue
-
-            if not artifact.supported_sms:
-                selection_log.append(
-                    "linux_cuda_selection: reject "
-                    f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
-                    "reason=artifact_missing_supported_sms"
-                )
-                continue
-            if artifact.min_sm is None or artifact.max_sm is None:
-                selection_log.append(
-                    "linux_cuda_selection: reject "
-                    f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
-                    "reason=artifact_missing_sm_bounds"
-                )
-                continue
-
-            supported_sms = {str(value) for value in artifact.supported_sms}
-            missing_sms = [sm for sm in host_sms if sm not in supported_sms]
-            out_of_range_sms = [
-                sm
-                for sm in host_sms
-                if not (artifact.min_sm <= int(sm) <= artifact.max_sm)
-            ]
-            reasons: list[str] = []
-            if missing_sms:
-                reasons.append(f"missing_sms={','.join(missing_sms)}")
-            if out_of_range_sms:
-                reasons.append(f"out_of_range_sms={','.join(out_of_range_sms)}")
-            if reasons:
-                selection_log.append(
-                    "linux_cuda_selection: reject "
-                    f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
-                    f"coverage={artifact.min_sm}-{artifact.max_sm} supported={','.join(artifact.supported_sms)} "
-                    f"reasons={' '.join(reasons)}"
-                )
-                continue
-
-            selection_log.append(
-                "linux_cuda_selection: accept "
-                f"{asset_name} runtime_line={runtime_line} coverage_class={artifact.coverage_class} "
-                f"coverage={artifact.min_sm}-{artifact.max_sm} supported={','.join(artifact.supported_sms)}"
-            )
-            if artifact.coverage_class == "portable":
-                portable_candidate = (artifact, asset_url)
-            else:
-                coverage_candidates.append((artifact, asset_url))
-
+        coverage_candidates, portable_candidate = _collect_candidates_for_runtime_line(
+            runtime_line, published_artifacts, release.assets,
+            host_sms, selection_log,
+        )
         if coverage_candidates:
-            artifact, url = sorted(
+            best_artifact, best_url = sorted(
                 coverage_candidates,
                 key = lambda item: (
                     (item[0].max_sm or 0) - (item[0].min_sm or 0),
@@ -2163,10 +2202,16 @@ def linux_cuda_choice_from_release(
                     item[0].max_sm or 0,
                 ),
             )[0]
-            add_attempt(artifact, url, "best coverage for runtime line")
+            _add_cuda_attempt(
+                best_artifact, best_url, "best coverage for runtime line",
+                release, selection_log, attempts, seen_attempts,
+            )
         if portable_candidate:
-            artifact, url = portable_candidate
-            add_attempt(artifact, url, "portable fallback for runtime line")
+            port_artifact, port_url = portable_candidate
+            _add_cuda_attempt(
+                port_artifact, port_url, "portable fallback for runtime line",
+                release, selection_log, attempts, seen_attempts,
+            )
 
     if not attempts:
         return None
@@ -2181,6 +2226,43 @@ def linux_cuda_choice_from_release(
             f"{attempt.name} runtime_line={attempt.runtime_line} coverage_class={attempt.coverage_class}"
         ]
     return LinuxCudaSelection(attempts = attempts, selection_log = selection_log)
+
+
+def _add_cuda_attempt(
+    artifact: PublishedLlamaArtifact,
+    asset_url: str,
+    reason: str,
+    release: PublishedReleaseBundle,
+    selection_log: list[str],
+    attempts: list[AssetChoice],
+    seen_attempts: set[str],
+) -> None:
+    asset_name = artifact.asset_name
+    if asset_name in seen_attempts:
+        return
+    seen_attempts.add(asset_name)
+    attempts.append(
+        AssetChoice(
+            repo = release.repo,
+            tag = release.release_tag,
+            name = asset_name,
+            url = asset_url,
+            source_label = "published",
+            is_ready_bundle = True,
+            install_kind = "linux-cuda",
+            bundle_profile = artifact.bundle_profile,
+            runtime_line = artifact.runtime_line,
+            coverage_class = artifact.coverage_class,
+            supported_sms = artifact.supported_sms,
+            min_sm = artifact.min_sm,
+            max_sm = artifact.max_sm,
+            selection_log = list(selection_log)
+            + [
+                "linux_cuda_selection: selected "
+                f"{asset_name} runtime_line={artifact.runtime_line} coverage_class={artifact.coverage_class} reason={reason}"
+            ],
+        )
+    )
 
 
 def latest_published_linux_cuda_tag(host: HostInfo, published_repo: str) -> str | None:
@@ -2547,6 +2629,195 @@ def run_capture(
     return result
 
 
+def _probe_nvidia_listing(
+    smi_path: str,
+    device_tokens: list[str],
+) -> tuple[bool, bool]:
+    """Run ``nvidia-smi -L`` and return (has_physical, has_usable)."""
+    try:
+        listing = run_capture([smi_path, "-L"], timeout = 20)
+        gpu_lines = [
+            line for line in listing.stdout.splitlines() if line.startswith("GPU ")
+        ]
+        if gpu_lines:
+            return True, device_tokens != []
+    except Exception:
+        pass
+    return False, False
+
+
+def _probe_driver_cuda_version(
+    smi_path: str,
+) -> tuple[int, int] | None:
+    """Parse the CUDA driver version from plain ``nvidia-smi`` output."""
+    try:
+        result = run_capture([smi_path], timeout = 20)
+        merged = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        for line in merged.splitlines():
+            if "CUDA Version:" in line:
+                raw = line.split("CUDA Version:", 1)[1].strip().split()[0]
+                major, minor = raw.split(".", 1)
+                return (int(major), int(minor))
+    except Exception:
+        pass
+    return None
+
+
+def _probe_nvidia_compute_caps(
+    smi_path: str,
+    device_tokens: list[str],
+    had_physical: bool,
+) -> tuple[bool, bool, list[str]]:
+    """Query per-GPU compute capabilities.
+
+    Returns ``(has_physical_nvidia, has_usable_nvidia, compute_caps)``.
+    """
+    compute_caps: list[str] = []
+    try:
+        caps = run_capture(
+            [
+                smi_path,
+                "--query-gpu=index,uuid,compute_cap",
+                "--format=csv,noheader",
+            ],
+            timeout = 20,
+        )
+        visible_gpu_rows = _collect_visible_gpu_rows(
+            caps.stdout, device_tokens, compute_caps
+        )
+        return _resolve_nvidia_usability(
+            visible_gpu_rows, device_tokens, had_physical
+        ) + (compute_caps,)
+    except Exception:
+        pass
+    return had_physical, False, compute_caps
+
+
+def _collect_visible_gpu_rows(
+    stdout: str,
+    device_tokens: list[str],
+    compute_caps: list[str],
+) -> list[tuple[str, str, str]]:
+    """Parse CSV rows and collect visible GPU rows and compute caps."""
+    visible_gpu_rows: list[tuple[str, str, str]] = []
+    for raw in stdout.splitlines():
+        parts = [part.strip() for part in raw.split(",")]
+        if len(parts) != 3:
+            continue
+        idx, uuid, cap = parts
+        matched = select_visible_gpu_rows(
+            [(idx, uuid, cap)],
+            device_tokens,
+        )
+        if not matched:
+            continue
+        visible_gpu_rows.extend(matched)
+        normalized_cap = normalize_compute_cap(cap)
+        if normalized_cap is not None and normalized_cap not in compute_caps:
+            compute_caps.append(normalized_cap)
+    return visible_gpu_rows
+
+
+def _resolve_nvidia_usability(
+    visible_gpu_rows: list[tuple[str, str, str]],
+    device_tokens: list[str],
+    had_physical: bool,
+) -> tuple[bool, bool]:
+    """Determine (has_physical_nvidia, has_usable_nvidia) from query results."""
+    if visible_gpu_rows:
+        # Older nvidia-smi versions (pre -L support) hit the
+        # except in the first try block but still succeed here,
+        # leaving has_physical_nvidia unset. Mirror the -L path
+        # so downstream diagnostics on line ~4390 still run.
+        return (True, True)
+    if device_tokens == []:
+        return (had_physical, False)
+    if supports_explicit_visible_device_matching(device_tokens):
+        return (had_physical, False)
+    if had_physical:
+        return (True, True)
+    return (had_physical, False)
+
+
+def _detect_nvidia(
+    visible_cuda_devices: str | None,
+) -> tuple[str | None, tuple[int, int] | None, list[str], bool, bool]:
+    """Detect NVIDIA GPUs and driver CUDA version.
+
+    Returns ``(nvidia_smi, driver_cuda_version, compute_caps,
+    has_physical_nvidia, has_usable_nvidia)``.
+    """
+    smi_path = shutil.which("nvidia-smi")
+    if not smi_path:
+        return None, None, [], False, False
+
+    device_tokens = parse_cuda_visible_devices(visible_cuda_devices)
+
+    # Require `nvidia-smi -L` to actually list a GPU before treating the
+    # host as NVIDIA. The banner text "NVIDIA-SMI ..." is printed even
+    # when the command fails to communicate with the driver (e.g. stale
+    # container leftovers), which would otherwise misclassify an AMD
+    # ROCm host as NVIDIA and short-circuit the ROCm path.
+    has_physical, has_usable = _probe_nvidia_listing(smi_path, device_tokens)
+    driver_cuda_version = _probe_driver_cuda_version(smi_path)
+    has_physical, has_usable, compute_caps = _probe_nvidia_compute_caps(
+        smi_path, device_tokens, has_physical
+    )
+
+    return smi_path, driver_cuda_version, compute_caps, has_physical, has_usable
+
+
+def _amd_smi_has_gpu(stdout: str) -> bool:
+    """Check for 'GPU: <number>' data rows, not just a table header."""
+    return bool(re.search(r"(?im)^gpu\s*[:\[]\s*\d", stdout))
+
+
+def _check_rocm_tools(
+    tool_specs: tuple[tuple[list[str], object], ...],
+) -> bool:
+    """Return True if any of the given ROCm tool commands detects a GPU."""
+    for cmd, check_fn in tool_specs:
+        exe = shutil.which(cmd[0])
+        if not exe:
+            continue
+        try:
+            result = run_capture([exe, *cmd[1:]], timeout = 10)
+        except Exception:
+            continue
+        if result.returncode == 0 and result.stdout.strip() and check_fn(result.stdout):
+            return True
+    return False
+
+
+def _detect_rocm(is_linux: bool, is_windows: bool) -> bool:
+    """Detect whether a usable AMD ROCm GPU is present."""
+    # Detect AMD ROCm (HIP) -- require actual GPU, not just tools installed
+    if is_linux:
+        return _check_rocm_tools((
+            # rocminfo: look for a real gfx GPU id (3-4 chars, nonzero first digit).
+            # gfx000 is the CPU agent; ROCm 6.1+ also emits generic ISA lines like
+            # "gfx11-generic" or "gfx9-4-generic" which only have 1-2 digits before
+            # the dash and must not be treated as a real GPU.
+            (
+                ["rocminfo"],
+                lambda out: bool(
+                    re.search(r"gfx[1-9][0-9a-z]{2,3}", out.lower())
+                ),
+            ),
+            (["amd-smi", "list"], _amd_smi_has_gpu),
+        ))
+    if is_windows:
+        # Windows: prefer active probes that validate GPU presence
+        result = _check_rocm_tools((
+            (["hipinfo"], lambda out: "gcnarchname" in out.lower()),
+            (["amd-smi", "list"], _amd_smi_has_gpu),
+        ))
+        # Note: amdhip64.dll presence alone is NOT treated as GPU evidence
+        # since the HIP SDK can be installed without an AMD GPU.
+        return result
+    return False
+
+
 def detect_host() -> HostInfo:
     system = platform.system()
     machine = platform.machine().lower()
@@ -2556,136 +2827,16 @@ def detect_host() -> HostInfo:
     is_x86_64 = machine in {"x86_64", "amd64"}
     is_arm64 = machine in {"arm64", "aarch64"}
 
-    nvidia_smi = shutil.which("nvidia-smi")
-    driver_cuda_version = None
-    compute_caps: list[str] = []
     visible_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    visible_device_tokens = parse_cuda_visible_devices(visible_cuda_devices)
-    has_physical_nvidia = False
-    has_usable_nvidia = False
-    if nvidia_smi:
-        # Require `nvidia-smi -L` to actually list a GPU before treating the
-        # host as NVIDIA. The banner text "NVIDIA-SMI ..." is printed even
-        # when the command fails to communicate with the driver (e.g. stale
-        # container leftovers), which would otherwise misclassify an AMD
-        # ROCm host as NVIDIA and short-circuit the ROCm path.
-        try:
-            listing = run_capture([nvidia_smi, "-L"], timeout = 20)
-            gpu_lines = [
-                line for line in listing.stdout.splitlines() if line.startswith("GPU ")
-            ]
-            if gpu_lines:
-                has_physical_nvidia = True
-                has_usable_nvidia = visible_device_tokens != []
-        except Exception:
-            pass
+    (
+        nvidia_smi,
+        driver_cuda_version,
+        compute_caps,
+        has_physical_nvidia,
+        has_usable_nvidia,
+    ) = _detect_nvidia(visible_cuda_devices)
 
-        try:
-            result = run_capture([nvidia_smi], timeout = 20)
-            merged = "\n".join(part for part in (result.stdout, result.stderr) if part)
-            for line in merged.splitlines():
-                if "CUDA Version:" in line:
-                    raw = line.split("CUDA Version:", 1)[1].strip().split()[0]
-                    major, minor = raw.split(".", 1)
-                    driver_cuda_version = (int(major), int(minor))
-                    break
-        except Exception:
-            pass
-
-        try:
-            caps = run_capture(
-                [
-                    nvidia_smi,
-                    "--query-gpu=index,uuid,compute_cap",
-                    "--format=csv,noheader",
-                ],
-                timeout = 20,
-            )
-            visible_gpu_rows: list[tuple[str, str, str]] = []
-            for raw in caps.stdout.splitlines():
-                parts = [part.strip() for part in raw.split(",")]
-                if len(parts) != 3:
-                    continue
-                index, uuid, cap = parts
-                visible_gpu_row = select_visible_gpu_rows(
-                    [(index, uuid, cap)],
-                    visible_device_tokens,
-                )
-                if not visible_gpu_row:
-                    continue
-                visible_gpu_rows.extend(visible_gpu_row)
-                normalized_cap = normalize_compute_cap(cap)
-                if normalized_cap is None:
-                    continue
-                if normalized_cap not in compute_caps:
-                    compute_caps.append(normalized_cap)
-
-            if visible_gpu_rows:
-                has_usable_nvidia = True
-                # Older nvidia-smi versions (pre -L support) hit the
-                # except in the first try block but still succeed here,
-                # leaving has_physical_nvidia unset. Mirror the -L path
-                # so downstream diagnostics on line ~4390 still run.
-                if not has_physical_nvidia:
-                    has_physical_nvidia = True
-            elif visible_device_tokens == []:
-                has_usable_nvidia = False
-            elif supports_explicit_visible_device_matching(visible_device_tokens):
-                has_usable_nvidia = False
-            elif has_physical_nvidia:
-                has_usable_nvidia = True
-        except Exception:
-            pass
-
-    # Detect AMD ROCm (HIP) -- require actual GPU, not just tools installed
-
-    def _amd_smi_has_gpu(stdout: str) -> bool:
-        """Check for 'GPU: <number>' data rows, not just a table header."""
-        return bool(re.search(r"(?im)^gpu\s*[:\[]\s*\d", stdout))
-
-    has_rocm = False
-    if is_linux:
-        for _cmd, _check in (
-            # rocminfo: look for a real gfx GPU id (3-4 chars, nonzero first digit).
-            # gfx000 is the CPU agent; ROCm 6.1+ also emits generic ISA lines like
-            # "gfx11-generic" or "gfx9-4-generic" which only have 1-2 digits before
-            # the dash and must not be treated as a real GPU.
-            (
-                ["rocminfo"],
-                lambda out: bool(re.search(r"gfx[1-9][0-9a-z]{2,3}", out.lower())),
-            ),
-            (["amd-smi", "list"], _amd_smi_has_gpu),
-        ):
-            _exe = shutil.which(_cmd[0])
-            if not _exe:
-                continue
-            try:
-                _result = run_capture([_exe, *_cmd[1:]], timeout = 10)
-            except Exception:
-                continue
-            if _result.returncode == 0 and _result.stdout.strip():
-                if _check(_result.stdout):
-                    has_rocm = True
-                    break
-    elif is_windows:
-        # Windows: prefer active probes that validate GPU presence
-        for _cmd, _check in (
-            (["hipinfo"], lambda out: "gcnarchname" in out.lower()),
-            (["amd-smi", "list"], _amd_smi_has_gpu),
-        ):
-            _exe = shutil.which(_cmd[0])
-            if not _exe:
-                continue
-            try:
-                _result = run_capture([_exe, *_cmd[1:]], timeout = 10)
-            except Exception:
-                continue
-            if _result.returncode == 0 and _result.stdout.strip():
-                if _check(_result.stdout):
-                    has_rocm = True
-                    break
-        # Note: amdhip64.dll presence alone is NOT treated as GPU evidence
-        # since the HIP SDK can be installed without an AMD GPU.
+    has_rocm = _detect_rocm(is_linux, is_windows)
 
     return HostInfo(
         system = system,
