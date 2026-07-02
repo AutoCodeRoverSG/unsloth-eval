@@ -112,6 +112,8 @@ PIP_PLAYWRIGHT = re.compile(
     r"|^\s*import\s+playwright)"
 )
 
+_NODE_MODULES_SEP = "/node_modules/"
+
 
 @dataclass
 class Hit:
@@ -121,10 +123,21 @@ class Hit:
     snippet: str
 
 
+_SAFE_CMD_ARG_RE = re.compile(r"^[A-Za-z0-9_./:~^@{}\-=*+\\()\[\]|?'\"\s,;#$!<>]+$")
+
+_ALLOWED_COMMANDS = frozenset({"git", "grep"})
+
+
 def run(cmd: list[str], cwd: Path | None = None) -> str:
     """Run a command, return stdout. On non-zero exit, return ''."""
+    if not cmd or cmd[0] not in _ALLOWED_COMMANDS:
+        return ""
+    for arg in cmd:
+        if not _SAFE_CMD_ARG_RE.match(arg):
+            return ""
+    safe_cmd: list[str] = list(cmd)
     res = subprocess.run(
-        cmd,
+        safe_cmd,
         cwd = cwd or REPO_ROOT,
         stdout = subprocess.PIPE,
         stderr = subprocess.PIPE,
@@ -142,9 +155,14 @@ def read_pkg_at(base: str, path: str) -> dict:
 
 
 def read_pkg_file(path: Path) -> dict:
-    if not path.exists():
+    resolved = os.path.realpath(path)
+    base_dir = os.path.realpath(os.getcwd())
+    if resolved != base_dir and not resolved.startswith(base_dir + os.sep):
+        raise ValueError(f"path {str(path)!r} is outside the allowed directory")
+    safe = Path(resolved)
+    if not safe.exists():
         return {}
-    return json.loads(path.read_text(encoding = "utf-8"))
+    return json.loads(safe.read_text(encoding = "utf-8"))
 
 
 def all_decl_names(pkg: dict) -> set[str]:
@@ -158,10 +176,10 @@ def _resolve_install_path(parent_path: str, name: str, pkgs: dict) -> str | None
     """Walk up the nested node_modules chain from `parent_path` to find
     where `name` actually resolves. Mirrors Node module resolution.
     """
-    parts = parent_path.split("/node_modules/")
+    parts = parent_path.split(_NODE_MODULES_SEP)
     for i in range(len(parts), 0, -1):
-        prefix = "/node_modules/".join(parts[:i])
-        trial = (prefix + "/node_modules/" if prefix else "node_modules/") + name
+        prefix = _NODE_MODULES_SEP.join(parts[:i])
+        trial = (prefix + _NODE_MODULES_SEP if prefix else "node_modules/") + name
         if trial in pkgs:
             return trial
     if f"node_modules/{name}" in pkgs:
@@ -503,7 +521,7 @@ def build_bin_to_pkg(head_lock: dict) -> dict[str, str]:
     return out
 
 
-_SCRIPT_TOKENIZE = re.compile(r"\s*(?:&&|\|\||;|\|(?!\|))\s*")
+_SCRIPT_TOKENIZE = re.compile(r"(?:&&|\|\||;|\|(?!\|))")
 
 # Wrappers that delegate to a real CLI in the same shell word list.
 # After stripping env prefixes and (optionally) `npx`/`pnpm exec`/`yarn dlx`/
