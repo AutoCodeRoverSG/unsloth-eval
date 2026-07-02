@@ -112,6 +112,8 @@ PIP_PLAYWRIGHT = re.compile(
     r"|^\s*import\s+playwright)"
 )
 
+_NODE_MODULES_SEP = "/node_modules/"
+
 
 @dataclass
 class Hit:
@@ -158,10 +160,10 @@ def _resolve_install_path(parent_path: str, name: str, pkgs: dict) -> str | None
     """Walk up the nested node_modules chain from `parent_path` to find
     where `name` actually resolves. Mirrors Node module resolution.
     """
-    parts = parent_path.split("/node_modules/")
+    parts = parent_path.split(_NODE_MODULES_SEP)
     for i in range(len(parts), 0, -1):
-        prefix = "/node_modules/".join(parts[:i])
-        trial = (prefix + "/node_modules/" if prefix else "node_modules/") + name
+        prefix = _NODE_MODULES_SEP.join(parts[:i])
+        trial = (prefix + _NODE_MODULES_SEP if prefix else "node_modules/") + name
         if trial in pkgs:
             return trial
     if f"node_modules/{name}" in pkgs:
