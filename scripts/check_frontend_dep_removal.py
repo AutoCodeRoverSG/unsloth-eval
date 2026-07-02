@@ -159,9 +159,10 @@ def read_pkg_file(path: Path) -> dict:
     base_dir = os.path.realpath(os.getcwd())
     if resolved != base_dir and not resolved.startswith(base_dir + os.sep):
         raise ValueError(f"path {str(path)!r} is outside the allowed directory")
-    if not path.exists():
+    safe = Path(resolved)
+    if not safe.exists():
         return {}
-    return json.loads(path.read_text(encoding = "utf-8"))
+    return json.loads(safe.read_text(encoding = "utf-8"))
 
 
 def all_decl_names(pkg: dict) -> set[str]:
@@ -520,7 +521,7 @@ def build_bin_to_pkg(head_lock: dict) -> dict[str, str]:
     return out
 
 
-_SCRIPT_TOKENIZE = re.compile(r"\s*+(?:&&|\|\||;|\|(?!\|))\s*+")
+_SCRIPT_TOKENIZE = re.compile(r"(?:&&|\|\||;|\|(?!\|))")
 
 # Wrappers that delegate to a real CLI in the same shell word list.
 # After stripping env prefixes and (optionally) `npx`/`pnpm exec`/`yarn dlx`/
