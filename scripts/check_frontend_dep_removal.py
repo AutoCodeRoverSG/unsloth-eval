@@ -123,10 +123,21 @@ class Hit:
     snippet: str
 
 
+_SAFE_CMD_ARG_RE = re.compile(r"^[A-Za-z0-9_./:~^@{}\-=*+\\()\[\]|?'\"\s,;#$!<>]+$")
+
+_ALLOWED_COMMANDS = frozenset({"git", "grep"})
+
+
 def run(cmd: list[str], cwd: Path | None = None) -> str:
     """Run a command, return stdout. On non-zero exit, return ''."""
+    if not cmd or cmd[0] not in _ALLOWED_COMMANDS:
+        return ""
+    for arg in cmd:
+        if not _SAFE_CMD_ARG_RE.match(arg):
+            return ""
+    safe_cmd: list[str] = list(cmd)
     res = subprocess.run(
-        cmd,
+        safe_cmd,
         cwd = cwd or REPO_ROOT,
         stdout = subprocess.PIPE,
         stderr = subprocess.PIPE,
@@ -144,6 +155,10 @@ def read_pkg_at(base: str, path: str) -> dict:
 
 
 def read_pkg_file(path: Path) -> dict:
+    resolved = os.path.realpath(path)
+    base_dir = os.path.realpath(os.getcwd())
+    if resolved != base_dir and not resolved.startswith(base_dir + os.sep):
+        raise ValueError(f"path {str(path)!r} is outside the allowed directory")
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding = "utf-8"))
@@ -505,7 +520,7 @@ def build_bin_to_pkg(head_lock: dict) -> dict[str, str]:
     return out
 
 
-_SCRIPT_TOKENIZE = re.compile(r"\s*(?:&&|\|\||;|\|(?!\|))\s*")
+_SCRIPT_TOKENIZE = re.compile(r"\s*+(?:&&|\|\||;|\|(?!\|))\s*+")
 
 # Wrappers that delegate to a real CLI in the same shell word list.
 # After stripping env prefixes and (optionally) `npx`/`pnpm exec`/`yarn dlx`/
