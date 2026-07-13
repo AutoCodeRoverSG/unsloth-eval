@@ -1709,7 +1709,7 @@ def _determine_username(save_directory, old_username, token):
             if type(old_username) is str and username != old_username:
                 username = old_username
             save_directory = f"{username}/{save_directory}"
-        except:
+        except Exception:
             raise RuntimeError(
                 f"Unsloth: {save_directory} is not a Huggingface directory."
             )
@@ -1754,7 +1754,7 @@ def create_huggingface_repo(
         if datasets:
             card.data.datasets = datasets
         card.push_to_hub(save_directory, token = token)
-    except:
+    except Exception:
         # Repo already exists — update datasets metadata separately
         if datasets:
             try:
@@ -2495,7 +2495,7 @@ def unsloth_push_to_hub_gguf(
             for d in [save_directory, f"{save_directory}_gguf"]:
                 try:
                     shutil.rmtree(d)
-                except:
+                except Exception:
                     pass
         raise RuntimeError(f"Failed to convert model to GGUF: {e}")
 
@@ -2671,7 +2671,7 @@ This model was finetuned and converted to GGUF format using [Unsloth](https://gi
                 tags = tags,
                 repo_type = "model",
             )
-        except:
+        except Exception:
             pass
 
         if datasets:
@@ -2699,7 +2699,7 @@ This model was finetuned and converted to GGUF format using [Unsloth](https://gi
                 if os.path.exists(d):
                     try:
                         shutil.rmtree(d)
-                    except:
+                    except Exception:
                         pass
 
     return full_repo_id
