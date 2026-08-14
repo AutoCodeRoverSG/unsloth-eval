@@ -5,6 +5,7 @@ import asyncio
 import importlib.util
 import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -724,38 +725,41 @@ class TestRouteErrors(unittest.TestCase):
             "routes/inference.py",
         )
         request = LoadRequest(model_path = "unsloth/test.gguf", gpu_ids = [0, 1])
-        model_config = SimpleNamespace(
-            is_gguf = True,
-            is_lora = False,
-            gguf_hf_repo = None,
-            gguf_file = "/tmp/test.gguf",
-            gguf_mmproj_file = None,
-            gguf_variant = None,
-            identifier = "unsloth/test.gguf",
-            display_name = "unsloth/test.gguf",
-            is_vision = False,
-            is_audio = False,
-            audio_type = None,
-            has_audio_input = False,
-        )
 
-        with patch.object(
-            inference_route.ModelConfig,
-            "from_identifier",
-            return_value = model_config,
-        ):
-            with self.assertRaises(HTTPException) as exc_info:
-                asyncio.run(
-                    inference_route.load_model(
-                        request,
-                        SimpleNamespace(
-                            app = SimpleNamespace(
-                                state = SimpleNamespace(llama_parallel_slots = 1),
-                            ),
-                        ),
-                        current_subject = "test-user",
-                    )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_config = SimpleNamespace(
+                is_gguf = True,
+                is_lora = False,
+                gguf_hf_repo = None,
+                gguf_file = str(Path(temp_dir) / "test.gguf"),
+                gguf_mmproj_file = None,
+                gguf_variant = None,
+                identifier = "unsloth/test.gguf",
+                display_name = "unsloth/test.gguf",
+                is_vision = False,
+                is_audio = False,
+                audio_type = None,
+                has_audio_input = False,
+            )
+
+            with patch.object(
+                inference_route.ModelConfig,
+                "from_identifier",
+                return_value = model_config,
+            ):
+                request_context = SimpleNamespace(
+                    app = SimpleNamespace(
+                        state = SimpleNamespace(llama_parallel_slots = 1),
+                    ),
                 )
+                load_model_coro = inference_route.load_model(
+                    request,
+                    request_context,
+                    current_subject = "test-user",
+                )
+
+                with self.assertRaises(HTTPException) as exc_info:
+                    asyncio.run(load_model_coro)
 
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("GGUF", exc_info.exception.detail)
@@ -794,10 +798,11 @@ class TestRouteErrors(unittest.TestCase):
                 return_value = SimpleNamespace(current_checkpoint = None),
             ),
         ):
+            training_task = training_route.start_training(
+                request, current_subject = "test-user"
+            )
             with self.assertRaises(HTTPException) as exc_info:
-                asyncio.run(
-                    training_route.start_training(request, current_subject = "test-user")
-                )
+                asyncio.run(training_task)
 
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("gpu_ids [99]", exc_info.exception.detail)
@@ -825,6 +830,8 @@ class TestRouteErrors(unittest.TestCase):
                     "Invalid gpu_ids [1]: explicit physical GPU IDs are unsupported when CUDA_VISIBLE_DEVICES uses UUID/MIG entries"
                 )
 
+        coroutine = training_route.start_training(request, current_subject = "test-user")
+
         with (
             patch.object(
                 training_route, "get_training_backend", return_value = DummyBackend()
@@ -839,9 +846,7 @@ class TestRouteErrors(unittest.TestCase):
             ),
         ):
             with self.assertRaises(HTTPException) as exc_info:
-                asyncio.run(
-                    training_route.start_training(request, current_subject = "test-user")
-                )
+                asyncio.run(coroutine)
 
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("UUID/MIG", exc_info.exception.detail)
@@ -871,6 +876,22 @@ class TestRouteErrors(unittest.TestCase):
             def load_model(self, **kwargs):
                 raise ValueError("Invalid gpu_ids [99]")
 
+        route_request = SimpleNamespace(
+            app = SimpleNamespace(
+                state = SimpleNamespace(llama_parallel_slots = 1),
+            ),
+        )
+
+        async def load_model_call():
+            await inference_route.load_model(
+                request,
+                route_request,
+                current_subject = "test-user",
+            )
+
+        def run_load_model_call():
+            asyncio.run(load_model_call())
+
         with (
             patch.object(
                 inference_route.ModelConfig,
@@ -892,18 +913,7 @@ class TestRouteErrors(unittest.TestCase):
                 return_value = SimpleNamespace(current_checkpoint = None),
             ),
         ):
-            with self.assertRaises(HTTPException) as exc_info:
-                asyncio.run(
-                    inference_route.load_model(
-                        request,
-                        SimpleNamespace(
-                            app = SimpleNamespace(
-                                state = SimpleNamespace(llama_parallel_slots = 1),
-                            ),
-                        ),
-                        current_subject = "test-user",
-                    )
-                )
+            exc_info = self.assertRaises(HTTPException, run_load_model_call)
 
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("gpu_ids [99]", exc_info.exception.detail)
@@ -935,6 +945,22 @@ class TestRouteErrors(unittest.TestCase):
                     "Invalid gpu_ids [1]: explicit physical GPU IDs are unsupported when CUDA_VISIBLE_DEVICES uses UUID/MIG entries"
                 )
 
+        route_request = SimpleNamespace(
+            app = SimpleNamespace(
+                state = SimpleNamespace(llama_parallel_slots = 1),
+            ),
+        )
+
+        async def load_model_call():
+            await inference_route.load_model(
+                request,
+                route_request,
+                current_subject = "test-user",
+            )
+
+        def run_load_model_call():
+            asyncio.run(load_model_call())
+
         with (
             patch.object(
                 inference_route.ModelConfig,
@@ -956,18 +982,7 @@ class TestRouteErrors(unittest.TestCase):
                 return_value = SimpleNamespace(current_checkpoint = None),
             ),
         ):
-            with self.assertRaises(HTTPException) as exc_info:
-                asyncio.run(
-                    inference_route.load_model(
-                        request,
-                        SimpleNamespace(
-                            app = SimpleNamespace(
-                                state = SimpleNamespace(llama_parallel_slots = 1),
-                            ),
-                        ),
-                        current_subject = "test-user",
-                    )
-                )
+            exc_info = self.assertRaises(HTTPException, run_load_model_call)
 
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("UUID/MIG", exc_info.exception.detail)
