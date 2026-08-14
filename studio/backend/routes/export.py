@@ -9,7 +9,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
@@ -93,9 +92,7 @@ async def load_checkpoint(
                 for _ in range(60):  # up to 30s
                     if not trn.is_training_active():
                         break
-                    import time
-
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.5)
                 else:
                     logger.warning(
                         "Training subprocess did not exit within 30s, proceeding anyway"
