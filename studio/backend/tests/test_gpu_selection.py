@@ -5,6 +5,7 @@ import asyncio
 import importlib.util
 import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -724,38 +725,40 @@ class TestRouteErrors(unittest.TestCase):
             "routes/inference.py",
         )
         request = LoadRequest(model_path = "unsloth/test.gguf", gpu_ids = [0, 1])
-        model_config = SimpleNamespace(
-            is_gguf = True,
-            is_lora = False,
-            gguf_hf_repo = None,
-            gguf_file = "/tmp/test.gguf",
-            gguf_mmproj_file = None,
-            gguf_variant = None,
-            identifier = "unsloth/test.gguf",
-            display_name = "unsloth/test.gguf",
-            is_vision = False,
-            is_audio = False,
-            audio_type = None,
-            has_audio_input = False,
-        )
 
-        with patch.object(
-            inference_route.ModelConfig,
-            "from_identifier",
-            return_value = model_config,
-        ):
-            with self.assertRaises(HTTPException) as exc_info:
-                asyncio.run(
-                    inference_route.load_model(
-                        request,
-                        SimpleNamespace(
-                            app = SimpleNamespace(
-                                state = SimpleNamespace(llama_parallel_slots = 1),
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_config = SimpleNamespace(
+                is_gguf = True,
+                is_lora = False,
+                gguf_hf_repo = None,
+                gguf_file = str(Path(temp_dir) / "test.gguf"),
+                gguf_mmproj_file = None,
+                gguf_variant = None,
+                identifier = "unsloth/test.gguf",
+                display_name = "unsloth/test.gguf",
+                is_vision = False,
+                is_audio = False,
+                audio_type = None,
+                has_audio_input = False,
+            )
+
+            with patch.object(
+                inference_route.ModelConfig,
+                "from_identifier",
+                return_value = model_config,
+            ):
+                with self.assertRaises(HTTPException) as exc_info:
+                    asyncio.run(
+                        inference_route.load_model(
+                            request,
+                            SimpleNamespace(
+                                app = SimpleNamespace(
+                                    state = SimpleNamespace(llama_parallel_slots = 1),
+                                ),
                             ),
-                        ),
-                        current_subject = "test-user",
+                            current_subject = "test-user",
+                        )
                     )
-                )
 
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("GGUF", exc_info.exception.detail)
